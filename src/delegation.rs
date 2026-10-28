@@ -235,10 +235,26 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
             }
         }
     }
-    // 2. First balanced {...}, tracking string literals so braces inside strings
-    //    don't throw off the depth count. ASCII braces/quotes only; UTF-8
-    //    continuation bytes (>=0x80) never collide with these markers.
-    let start = reply.find('{')?;
+    // 2. First balanced {...} that parses as a JSON object. Not simply the first:
+    //    the conversation record wraps code as `<CodeBlock … editable={false}>`,
+    //    and that attribute is a balanced pair ahead of the real object. With no
+    //    valid object anywhere, keep the first balanced span so the caller's
+    //    parse error still shows what was found.
+    let mut first = None;
+    for (start, _) in reply.match_indices('{') {
+        let Some(span) = balanced_object_at(reply, start) else { continue };
+        if matches!(serde_json::from_str::<serde_json::Value>(span), Ok(serde_json::Value::Object(_))) {
+            return Some(span.to_string());
+        }
+        first.get_or_insert(span);
+    }
+    first.map(str::to_string)
+}
+
+/// The balanced `{...}` starting at byte `start`, tracking string literals so
+/// braces inside strings don't throw off the depth count. ASCII braces/quotes
+/// only; UTF-8 continuation bytes (>=0x80) never collide with these markers.
+fn balanced_object_at(reply: &str, start: usize) -> Option<&str> {
     let bytes = reply.as_bytes();
     let (mut depth, mut in_str, mut esc) = (0i32, false, false);
     for (i, &b) in bytes[start..].iter().enumerate() {
@@ -257,7 +273,7 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        return Some(reply[start..start + i + 1].to_string());
+                        return Some(&reply[start..start + i + 1]);
                     }
                 }
                 _ => {}
@@ -272,6 +288,16 @@ pub(crate) fn extract_json_object(reply: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_skips_codeblock_wrapper_braces() {
+        // ChatGPT's conversation record now wraps code in a JSX-like tag whose
+        // attribute `editable={false}` is the first balanced `{...}` in the reply.
+        let reply = "<CodeBlock language=\"json\" editable={false}>\n{\"goal\": \"g\", \"verdict\": \"proceed\"}\n</CodeBlock>";
+        let raw = extract_json_object(reply).expect("object found");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(v["goal"], "g");
+    }
 
     fn make_packet_json(verdict: &str) -> String {
         format!(
